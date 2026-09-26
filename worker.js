@@ -494,3 +494,145 @@ const WS_READY_STATE_CLOSING = 2;
 /**
  * Normally, WebSocket will not has exceptions when close.
  * @param {import("@cloudflare/workers-types").WebSocket} socket
+ */
+function safeCloseWebSocket(socket) {
+    try {
+        if (socket.readyState === WS_READY_STATE_OPEN || socket.readyState === WS_READY_STATE_CLOSING) {
+            socket.close();
+        }
+    } catch (error) {
+        console.error('safeCloseWebSocket error', error);
+    }
+}
+
+const byteToHex = [];
+for (let i = 0; i < 256; ++i) {
+    byteToHex.push((i + 256).toString(16).slice(1));
+}
+function unsafeStringify(arr, offset = 0) {
+    return (byteToHex[arr[offset + 0]] + byteToHex[arr[offset + 1]] + byteToHex[arr[offset + 2]] + byteToHex[arr[offset + 3]] + "-" + byteToHex[arr[offset + 4]] + byteToHex[arr[offset + 5]] + "-" + byteToHex[arr[offset + 6]] + byteToHex[arr[offset + 7]] + "-" + byteToHex[arr[offset + 8]] + byteToHex[arr[offset + 9]] + "-" + byteToHex[arr[offset + 10]] + byteToHex[arr[offset + 11]] + byteToHex[arr[offset + 12]] + byteToHex[arr[offset + 13]] + byteToHex[arr[offset + 14]] + byteToHex[arr[offset + 15]]).toLowerCase();
+}
+function stringify(arr, offset = 0) {
+    const uuid = unsafeStringify(arr, offset);
+    if (!isValidUUID(uuid)) {
+        throw TypeError("Stringified UUID is invalid");
+    }
+    return uuid;
+}
+
+
+/**
+ * 
+ * @param {import("@cloudflare/workers-types").WebSocket} webSocket 
+ * @param {ArrayBuffer} vlessResponseHeader 
+ * @param {(string)=> void} log 
+ */
+async function handleUDPOutBound(webSocket, vlessResponseHeader, log) {
+
+    let isVlessHeaderSent = false;
+    const transformStream = new TransformStream({
+        start(controller) {
+
+        },
+        transform(chunk, controller) {
+            // udp message 2 byte is the the length of udp data
+            // TODO: this should have bug, beacsue maybe udp chunk can be in two websocket message
+            for (let index = 0; index < chunk.byteLength;) {
+                const lengthBuffer = chunk.slice(index, index + 2);
+                const udpPakcetLength = new DataView(lengthBuffer).getUint16(0);
+                const udpData = new Uint8Array(
+                    chunk.slice(index + 2, index + 2 + udpPakcetLength)
+                );
+                index = index + 2 + udpPakcetLength;
+                controller.enqueue(udpData);
+            }
+        },
+        flush(controller) {
+        }
+    });
+
+    // only handle dns udp for now
+    transformStream.readable.pipeTo(new WritableStream({
+        async write(chunk) {
+            const resp = await fetch('https://1.1.1.1/dns-query',
+                {
+                    method: 'POST',
+                    headers: {
+                        'content-type': 'application/dns-message',
+                    },
+                    body: chunk,
+                })
+            const dnsQueryResult = await resp.arrayBuffer();
+            const udpSize = dnsQueryResult.byteLength;
+            // console.log([...new Uint8Array(dnsQueryResult)].map((x) => x.toString(16)));
+            const udpSizeBuffer = new Uint8Array([(udpSize >> 8) & 0xff, udpSize & 0xff]);
+            if (webSocket.readyState === WS_READY_STATE_OPEN) {
+                log(`doh success and dns message length is ${udpSize}`);
+                if (isVlessHeaderSent) {
+                    webSocket.send(await new Blob([udpSizeBuffer, dnsQueryResult]).arrayBuffer());
+                } else {
+                    webSocket.send(await new Blob([vlessResponseHeader, udpSizeBuffer, dnsQueryResult]).arrayBuffer());
+                    isVlessHeaderSent = true;
+                }
+            }
+        }
+    })).catch((error) => {
+        log('dns udp has error' + error)
+    });
+
+    const writer = transformStream.writable.getWriter();
+
+    return {
+        /**
+         * 
+         * @param {Uint8Array} chunk 
+         */
+        write(chunk) {
+            writer.write(chunk);
+        }
+    };
+}
+
+/**
+ * 
+ * @param {string} userID 
+ * @param {string | null} hostName
+ * @returns {string}
+ */
+function getVLESSConfig(userID, hostName) {
+    const outboundConfig = {
+        "protocol": "vless",
+        "settings": {
+            "vnext": [
+                {
+                    "address": hostName,
+                    "port": 443,
+                    "users": [
+                        {
+                            "id": userID,
+                            "level": 0,
+                            "encryption": "none"
+                        }
+                    ]
+                }
+            ]
+        },
+        "streamSettings": {
+            "network": "ws",
+            "security": "tls",
+            "tlsSettings": {
+                "serverName": hostName,
+                "allowInsecure": false
+            },
+            "wsSettings": {
+                "path": "/?ed=2048",
+                "headers": {
+                    "Host": hostName
+                }
+            }
+        },
+        "tag": "cloudflare"    
+    };
+
+    return JSON.stringify(outboundConfig, null, 2);
+}
