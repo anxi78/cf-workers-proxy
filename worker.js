@@ -348,3 +348,149 @@ function processVlessHeader(
             )[0];
             addressValueIndex += 1;
             addressValue = new TextDecoder().decode(
+                vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength)
+            );
+            break;
+        case 3:
+            addressLength = 16;
+            const dataView = new DataView(
+                vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength)
+            );
+            // 2001:0db8:85a3:0000:0000:8a2e:0370:7334
+            const ipv6 = [];
+            for (let i = 0; i < 8; i++) {
+                ipv6.push(dataView.getUint16(i * 2).toString(16));
+            }
+            addressValue = ipv6.join(':');
+            // seems no need add [] for ipv6
+            break;
+        default:
+            return {
+                hasError: true,
+                message: `invild  addressType is ${addressType}`,
+            };
+    }
+    if (!addressValue) {
+        return {
+            hasError: true,
+            message: `addressValue is empty, addressType is ${addressType}`,
+        };
+    }
+
+    return {
+        hasError: false,
+        addressRemote: addressValue,
+        addressType,
+        portRemote,
+        rawDataIndex: addressValueIndex + addressLength,
+        vlessVersion: version,
+        isUDP,
+    };
+}
+
+
+/**
+ * 
+ * @param {import("@cloudflare/workers-types").Socket} remoteSocket 
+ * @param {import("@cloudflare/workers-types").WebSocket} webSocket 
+ * @param {ArrayBuffer} vlessResponseHeader 
+ * @param {(() => Promise<void>) | null} retry
+ * @param {*} log 
+ */
+async function remoteSocketToWS(remoteSocket, webSocket, vlessResponseHeader, retry, log) {
+    // remote--> ws
+    let remoteChunkCount = 0;
+    let chunks = [];
+    /** @type {ArrayBuffer | null} */
+    let vlessHeader = vlessResponseHeader;
+    let hasIncomingData = false; // check if remoteSocket has incoming data
+    await remoteSocket.readable
+        .pipeTo(
+            new WritableStream({
+                start() {
+                },
+                /**
+                 * 
+                 * @param {Uint8Array} chunk 
+                 * @param {*} controller 
+                 */
+                async write(chunk, controller) {
+                    hasIncomingData = true;
+                    // remoteChunkCount++;
+                    if (webSocket.readyState !== WS_READY_STATE_OPEN) {
+                        controller.error(
+                            'webSocket.readyState is not open, maybe close'
+                        );
+                    }
+                    if (vlessHeader) {
+                        webSocket.send(await new Blob([vlessHeader, chunk]).arrayBuffer());
+                        vlessHeader = null;
+                    } else {
+                        // seems no need rate limit this, CF seems fix this??..
+                        // if (remoteChunkCount > 20000) {
+                        //         // cf one package is 4096 byte(4kb),  4096 * 20000 = 80M
+                        //         await delay(1);
+                        // }
+                        webSocket.send(chunk);
+                    }
+                },
+                close() {
+                    log(`remoteConnection!.readable is close with hasIncomingData is ${hasIncomingData}`);
+                    // safeCloseWebSocket(webSocket); // no need server close websocket frist for some case will casue HTTP ERR_CONTENT_LENGTH_MISMATCH issue, client will send close event anyway.
+                },
+                abort(reason) {
+                    console.error(`remoteConnection!.readable abort`, reason);
+                },
+            })
+        )
+        .catch((error) => {
+            console.error(
+                `remoteSocketToWS has exception `,
+                error.stack || error
+            );
+            safeCloseWebSocket(webSocket);
+        });
+
+    // seems is cf connect socket have error,
+    // 1. Socket.closed will have error
+    // 2. Socket.readable will be close without any data coming
+    if (hasIncomingData === false && retry) {
+        log(`retry`)
+        retry();
+    }
+}
+
+/**
+ * 
+ * @param {string} base64Str 
+ * @returns 
+ */
+function base64ToArrayBuffer(base64Str) {
+    if (!base64Str) {
+        return { error: null };
+    }
+    try {
+        // go use modified Base64 for URL rfc4648 which js atob not support
+        base64Str = base64Str.replace(/-/g, '+').replace(/_/g, '/');
+        const decode = atob(base64Str);
+        const arryBuffer = Uint8Array.from(decode, (c) => c.charCodeAt(0));
+        return { earlyData: arryBuffer.buffer, error: null };
+    } catch (error) {
+        return { error };
+    }
+}
+
+/**
+ * This is not real UUID validation
+ * @param {string} uuid 
+ */
+function isValidUUID(uuid) {
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[4][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    return uuidRegex.test(uuid);
+}
+
+const WS_READY_STATE_OPEN = 1;
+const WS_READY_STATE_CLOSING = 2;
+/**
+ * Normally, WebSocket will not has exceptions when close.
+ * @param {import("@cloudflare/workers-types").WebSocket} socket
