@@ -200,3 +200,151 @@ async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawCli
     // remote--> ws
     remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, retry, log);
 }
+
+/**
+ * 
+ * @param {import("@cloudflare/workers-types").WebSocket} webSocketServer
+ * @param {string} earlyDataHeader for ws 0rtt
+ * @param {(info: string)=> void} log for ws 0rtt
+ */
+function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
+    let readableStreamCancel = false;
+    const stream = new ReadableStream({
+        start(controller) {
+            webSocketServer.addEventListener('message', (event) => {
+                if (readableStreamCancel) {
+                    return;
+                }
+                const message = event.data;
+                controller.enqueue(message);
+            });
+
+            // The event means that the client closed the client -> server stream.
+            // However, the server -> client stream is still open until you call close() on the server side.
+            // The WebSocket protocol says that a separate close message must be sent in each direction to fully close the socket.
+            webSocketServer.addEventListener('close', () => {
+                // client send close, need close server
+                // if stream is cancel, skip controller.close
+                safeCloseWebSocket(webSocketServer);
+                if (readableStreamCancel) {
+                    return;
+                }
+                controller.close();
+            }
+            );
+            webSocketServer.addEventListener('error', (err) => {
+                log('webSocketServer has error');
+                controller.error(err);
+            }
+            );
+            // for ws 0rtt
+            const { earlyData, error } = base64ToArrayBuffer(earlyDataHeader);
+            if (error) {
+                controller.error(error);
+            } else if (earlyData) {
+                controller.enqueue(earlyData);
+            }
+        },
+
+        pull(controller) {
+            // if ws can stop read if stream is full, we can implement backpressure
+            // https://streams.spec.whatwg.org/#example-rs-push-backpressure
+        },
+        cancel(reason) {
+            // 1. pipe WritableStream has error, this cancel will called, so ws handle server close into here
+            // 2. if readableStream is cancel, all controller.close/enqueue need skip,
+            // 3. but from testing controller.error still work even if readableStream is cancel
+            if (readableStreamCancel) {
+                return;
+            }
+            log(`ReadableStream was canceled, due to ${reason}`)
+            readableStreamCancel = true;
+            safeCloseWebSocket(webSocketServer);
+        }
+    });
+
+    return stream;
+
+}
+
+// https://xtls.github.io/development/protocols/vless.html
+// https://github.com/zizifn/excalidraw-backup/blob/main/v2ray-protocol.excalidraw
+
+/**
+ * 
+ * @param { ArrayBuffer} vlessBuffer 
+ * @param {string} userID 
+ * @returns 
+ */
+function processVlessHeader(
+    vlessBuffer,
+    userID
+) {
+    if (vlessBuffer.byteLength < 24) {
+        return {
+            hasError: true,
+            message: 'invalid data',
+        };
+    }
+    const version = new Uint8Array(vlessBuffer.slice(0, 1));
+    let isValidUser = false;
+    let isUDP = false;
+    if (stringify(new Uint8Array(vlessBuffer.slice(1, 17))) === userID) {
+        isValidUser = true;
+    }
+    if (!isValidUser) {
+        return {
+            hasError: true,
+            message: 'invalid user',
+        };
+    }
+
+    const optLength = new Uint8Array(vlessBuffer.slice(17, 18))[0];
+    //skip opt for now
+
+    const command = new Uint8Array(
+        vlessBuffer.slice(18 + optLength, 18 + optLength + 1)
+    )[0];
+
+    // 0x01 TCP
+    // 0x02 UDP
+    // 0x03 MUX
+    if (command === 1) {
+    } else if (command === 2) {
+        isUDP = true;
+    } else {
+        return {
+            hasError: true,
+            message: `command ${command} is not support, command 01-tcp,02-udp,03-mux`,
+        };
+    }
+    const portIndex = 18 + optLength + 1;
+    const portBuffer = vlessBuffer.slice(portIndex, portIndex + 2);
+    // port is big-Endian in raw data etc 80 == 0x005d
+    const portRemote = new DataView(portBuffer).getUint16(0);
+
+    let addressIndex = portIndex + 2;
+    const addressBuffer = new Uint8Array(
+        vlessBuffer.slice(addressIndex, addressIndex + 1)
+    );
+
+    // 1--> ipv4  addressLength =4
+    // 2--> domain name addressLength=addressBuffer[1]
+    // 3--> ipv6  addressLength =16
+    const addressType = addressBuffer[0];
+    let addressLength = 0;
+    let addressValueIndex = addressIndex + 1;
+    let addressValue = '';
+    switch (addressType) {
+        case 1:
+            addressLength = 4;
+            addressValue = new Uint8Array(
+                vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength)
+            ).join('.');
+            break;
+        case 2:
+            addressLength = new Uint8Array(
+                vlessBuffer.slice(addressValueIndex, addressValueIndex + 1)
+            )[0];
+            addressValueIndex += 1;
+            addressValue = new TextDecoder().decode(
