@@ -1,4 +1,4 @@
-name = "cf-workers-proxy"
+name = "cf-workers--proxy"
 main = "worker.js"
 compatibility_date = "2025-01-01"
 # 如果用 ES 模块、Durable Object、KV 等再补对应配置
